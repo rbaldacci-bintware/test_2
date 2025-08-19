@@ -1,0 +1,9 @@
+langgraph
+requests
+python-dotenv
+Pillow
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+google-generativeai
