@@ -7,3 +7,6 @@ uvicorn[standard]
 pydantic
 python-multipart
 google-generativeai
+langchain
+PyMuPDF
+pdfplumber 
