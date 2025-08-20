@@ -409,6 +409,99 @@ def table_chunker_node(state: PDFChunkingState) -> Dict:
     logger.info(f"    Generati {len(all_table_chunks)} chunk dalle tabelle")
     return {"table_chunks": all_table_chunks}
 
+def validate_and_clean_chunks_node(state: PDFChunkingState) -> Dict:
+    """Usa LLM per validare e pulire i chunk prima del merge finale."""
+    logger.info(">>> NODO: Validazione e Pulizia Chunks con LLM...")
+    
+    text_chunks = state.get("text_chunks", [])
+    table_chunks = state.get("table_chunks", [])
+    
+    cleaned_text_chunks = []
+    cleaned_table_chunks = table_chunks  # Le tabelle sono già pulite dal tuo agente
+    
+    # Processa i text chunks con LLM per validazione e pulizia
+    for chunk in text_chunks:
+        content = chunk.get("content", "")
+        
+        # Se il chunk è molto corto, tienilo così com'è
+        if len(content) < 100:
+            cleaned_text_chunks.append(chunk)
+            continue
+        
+        # Usa LLM per validare e pulire
+        validation_prompt = f"""Analizza questo chunk di testo estratto da un PDF.
+
+TESTO DA ANALIZZARE:
+{content}
+
+COMPITI:
+1. Determina se il testo è valido o corrotto (errori OCR, numeri casuali, frammenti di tabella)
+2. Se è corrotto ma recuperabile, fornisci una versione pulita
+3. Se è irrecuperabile, marcalo per esclusione
+4. Assegna un punteggio di qualità da 0 a 1
+
+Rispondi SOLO con JSON:
+{{
+    "is_valid": true/false,
+    "quality_score": 0.0-1.0,
+    "issues_found": ["lista problemi"] o [],
+    "cleaned_content": "testo pulito se recuperabile, altrimenti null",
+    "should_exclude": true/false,
+    "chunk_type_correction": "text" o "mixed_table_text" o "corrupted"
+}}"""
+
+        try:
+            model = genai.GenerativeModel("gemini-2.5-flash")
+            generation_config = genai.types.GenerationConfig(
+                response_mime_type="application/json",
+                temperature=0.1
+            )
+            
+            response = model.generate_content(
+                contents=validation_prompt,
+                generation_config=generation_config
+            )
+            
+            if response.text:
+                validation = json.loads(response.text)
+                
+                # Se il chunk deve essere escluso, saltalo
+                if validation.get("should_exclude", False):
+                    logger.warning(f"    Chunk escluso per bassa qualità: {validation.get('issues_found', [])}")
+                    continue
+                
+                # Se c'è contenuto pulito, usalo
+                if validation.get("cleaned_content"):
+                    chunk["content"] = validation["cleaned_content"]
+                    chunk["text_representation"] = validation["cleaned_content"]
+                    chunk["embedding_text"] = f"Documento: {state['pdf_name']}. {validation['cleaned_content']}"
+                
+                # Aggiungi metadati di qualità
+                chunk["metadata"]["quality_score"] = validation.get("quality_score", 0.5)
+                chunk["metadata"]["validation_issues"] = validation.get("issues_found", [])
+                chunk["metadata"]["was_cleaned"] = validation.get("cleaned_content") is not None
+                
+                # Solo includi chunk con qualità accettabile
+                if validation.get("quality_score", 0) >= 0.3:
+                    cleaned_text_chunks.append(chunk)
+                else:
+                    logger.warning(f"    Chunk rimosso per qualità troppo bassa: {validation.get('quality_score')}")
+                    
+        except Exception as e:
+            logger.error(f"Errore nella validazione LLM, mantengo chunk originale: {e}")
+            # In caso di errore, mantieni il chunk ma marca come non validato
+            chunk["metadata"]["quality_score"] = 0.5
+            chunk["metadata"]["validation_status"] = "not_validated"
+            cleaned_text_chunks.append(chunk)
+    
+    logger.info(f"    Text chunks dopo validazione: {len(cleaned_text_chunks)} (da {len(text_chunks)})")
+    logger.info(f"    Table chunks mantenuti: {len(cleaned_table_chunks)}")
+    
+    return {
+        "text_chunks": cleaned_text_chunks,
+        "table_chunks": cleaned_table_chunks
+    }
+
 def final_merger_node(state: PDFChunkingState) -> Dict:
     """Unisce e formatta tutti i chunk per essere pronti all'upsert."""
     logger.info(">>> NODO: Preparazione finale chunks per upsert...")
@@ -502,6 +595,7 @@ def create_orchestrator_agent():
     workflow.add_node("table_extractor", table_extractor_node)
     workflow.add_node("ai_text_chunker", ai_text_chunker_node)
     workflow.add_node("table_chunker", table_chunker_node)
+    workflow.add_node("validate_and_clean", validate_and_clean_chunks_node)  # NUOVO NODO
     workflow.add_node("final_merger", final_merger_node)
     
     # Entry point
@@ -536,30 +630,27 @@ def create_orchestrator_agent():
         if strategy == "mixed_content":
             return "process_tables"
         else:
-            return "merge"
+            return "validate"  # Vai alla validazione
     
     workflow.add_conditional_edges(
         "ai_text_chunker",
         route_after_text_chunking,
         {
             "process_tables": "table_extractor",
-            "merge": "final_merger"
+            "validate": "validate_and_clean"
         }
     )
     
     # Dopo estrazione tabelle
     workflow.add_edge("table_extractor", "table_chunker")
     
-    # Se partito da tables_only
-    def route_after_table_extraction(state: PDFChunkingState):
-        strategy = state.get("processing_strategy", "")
-        if strategy == "tables_only":
-            return "table_chunker"
-        else:  # mixed_content
-            return "table_chunker"
+    # Dopo chunking tabelle -> validazione
+    workflow.add_edge("table_chunker", "validate_and_clean")
     
-    # Tutti i percorsi convergono al merger finale
-    workflow.add_edge("table_chunker", "final_merger")
+    # Dopo validazione -> merger finale
+    workflow.add_edge("validate_and_clean", "final_merger")
+    
+    # Merger finale -> END
     workflow.add_edge("final_merger", END)
     
     return workflow.compile()
